@@ -5,6 +5,8 @@ Single-file deterministic scorer based on per-chunk behavioral signals
 step. Pinned commit so the running scoring logic is publicly verifiable.
 """
 
+import json
+import os
 import time
 from collections import Counter
 from pathlib import Path
@@ -24,6 +26,13 @@ from poker44.validator.synapse import DetectionSynapse
 PINNED_REPO_URL = "https://github.com/m0rf1us/poker44-miner-baseline"
 PINNED_REPO_COMMIT = "{{REPO_COMMIT}}"
 
+DUMP_PATH = os.getenv("POKER44_CHUNKS_DUMP_PATH", "")
+DUMP_UIDS = {
+    s.strip()
+    for s in os.getenv("POKER44_DUMP_UIDS", "").split(",")
+    if s.strip()
+}
+
 
 class Miner(BaseMinerNeuron):
     """Heuristic Poker44 miner with publicly verifiable scoring."""
@@ -36,7 +45,7 @@ class Miner(BaseMinerNeuron):
             implementation_files=[Path(__file__).resolve()],
             defaults={
                 "model_name": "poker44-baseline-v1",
-                "model_version": "1.0.1",
+                "model_version": "1.0.2",
                 "framework": "python-heuristic",
                 "license": "MIT",
                 "repo_url": PINNED_REPO_URL,
@@ -78,7 +87,32 @@ class Miner(BaseMinerNeuron):
             f"Scored {len(chunks)} chunks | "
             f"True={n_true} False={len(scores) - n_true}"
         )
+        self._maybe_dump(chunks, scores, synapse)
         return synapse
+
+    def _maybe_dump(self, chunks, scores, synapse) -> None:
+        if not DUMP_PATH:
+            return
+        if DUMP_UIDS and str(self.uid) not in DUMP_UIDS:
+            return
+        try:
+            try:
+                vhk = synapse.dendrite.hotkey if synapse.dendrite else "?"
+            except Exception:
+                vhk = "?"
+            record = {
+                "ts": int(time.time()),
+                "uid": int(self.uid),
+                "validator_hotkey": vhk,
+                "chunks": [
+                    {"score": float(scores[i]), "hands": chunks[i]}
+                    for i in range(len(chunks))
+                ],
+            }
+            with open(DUMP_PATH, "a") as fh:
+                fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+        except Exception as exc:
+            bt.logging.warning(f"chunks dump failed: {exc}")
 
     @staticmethod
     def _clamp01(value: float) -> float:
