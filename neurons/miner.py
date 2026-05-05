@@ -40,6 +40,11 @@ DUMP_UIDS = {
     if s.strip()
 }
 CALIBRATION_PATH = os.getenv("POKER44_CALIBRATION_PATH", "")
+CALIBRATION_UIDS = {
+    s.strip()
+    for s in os.getenv("POKER44_CALIBRATION_UIDS", "").split(",")
+    if s.strip()
+}
 
 
 class _CalibrationCache:
@@ -133,16 +138,23 @@ class Miner(BaseMinerNeuron):
     ) -> DetectionSynapse:
         chunks = synapse.chunks or []
         raw_scores = [self._score_chunk(chunk) for chunk in chunks]
-        scores = [_apply_calibration(r) for r in raw_scores]
+        calib_eligible = (
+            not CALIBRATION_UIDS or str(self.uid) in CALIBRATION_UIDS
+        )
+        if calib_eligible and _CALIB.get() is not None:
+            scores = [_apply_calibration(r) for r in raw_scores]
+            calib_state = "on"
+        else:
+            scores = list(raw_scores)
+            calib_state = "off"
         synapse.risk_scores = scores
         synapse.predictions = [s >= 0.5 for s in scores]
         synapse.model_manifest = dict(self.model_manifest)
         n_true = sum(1 for s in scores if s >= 0.5)
-        calib_active = _CALIB.get() is not None
         bt.logging.info(
             f"Scored {len(chunks)} chunks | "
             f"True={n_true} False={len(scores) - n_true} "
-            f"calib={'on' if calib_active else 'off'}"
+            f"calib={calib_state}"
         )
         self._maybe_dump(chunks, raw_scores, synapse)
         return synapse
