@@ -1,16 +1,23 @@
-"""Poker44 miner — heuristic baseline.
+"""Poker44 miner — heuristic baseline + optional sigmoid calibration.
 
 Single-file deterministic scorer based on per-chunk behavioral signals
-(action-type ratios, street depth, showdown flag, player count). No training
-step. Pinned commit so the running scoring logic is publicly verifiable.
+(action-type ratios, street depth, showdown flag, player count).
+
+Optionally applies a sigmoid calibration on top of the raw score:
+final = 1 / (1 + exp(-(raw - offset) * scale))
+The calibration parameters are loaded from a JSON file pointed to by
+POKER44_CALIBRATION_PATH; the file is hot-reloaded on each forward via
+mtime check. If the file is missing or unreadable, the raw baseline
+score is emitted unchanged.
 """
 
 import json
+import math
 import os
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 import bittensor as bt
 
@@ -32,6 +39,53 @@ DUMP_UIDS = {
     for s in os.getenv("POKER44_DUMP_UIDS", "").split(",")
     if s.strip()
 }
+CALIBRATION_PATH = os.getenv("POKER44_CALIBRATION_PATH", "")
+
+
+class _CalibrationCache:
+    """Hot-reloads sigmoid params from a JSON file via mtime."""
+
+    def __init__(self):
+        self._mtime = 0.0
+        self._params: Optional[dict] = None
+
+    def get(self) -> Optional[dict]:
+        if not CALIBRATION_PATH:
+            return None
+        try:
+            mt = os.path.getmtime(CALIBRATION_PATH)
+        except OSError:
+            return self._params
+        if mt <= self._mtime and self._params is not None:
+            return self._params
+        try:
+            with open(CALIBRATION_PATH, "r") as fh:
+                obj = json.load(fh)
+            scale = float(obj.get("scale"))
+            offset = float(obj.get("offset"))
+            self._params = {"scale": scale, "offset": offset}
+            self._mtime = mt
+            bt.logging.info(
+                f"[calib] reloaded scale={scale} offset={offset}"
+            )
+        except Exception as exc:
+            bt.logging.warning(f"[calib] reload failed: {exc}")
+        return self._params
+
+
+_CALIB = _CalibrationCache()
+
+
+def _apply_calibration(raw: float) -> float:
+    p = _CALIB.get()
+    if not p:
+        return raw
+    try:
+        z = (raw - p["offset"]) * p["scale"]
+        z = max(-30.0, min(30.0, z))
+        return 1.0 / (1.0 + math.exp(-z))
+    except Exception:
+        return raw
 
 
 class Miner(BaseMinerNeuron):
@@ -45,7 +99,7 @@ class Miner(BaseMinerNeuron):
             implementation_files=[Path(__file__).resolve()],
             defaults={
                 "model_name": "poker44-baseline-v1",
-                "model_version": "1.0.2",
+                "model_version": "1.0.3",
                 "framework": "python-heuristic",
                 "license": "MIT",
                 "repo_url": PINNED_REPO_URL,
@@ -78,16 +132,19 @@ class Miner(BaseMinerNeuron):
         self, synapse: DetectionSynapse
     ) -> DetectionSynapse:
         chunks = synapse.chunks or []
-        scores = [self._score_chunk(chunk) for chunk in chunks]
+        raw_scores = [self._score_chunk(chunk) for chunk in chunks]
+        scores = [_apply_calibration(r) for r in raw_scores]
         synapse.risk_scores = scores
         synapse.predictions = [s >= 0.5 for s in scores]
         synapse.model_manifest = dict(self.model_manifest)
         n_true = sum(1 for s in scores if s >= 0.5)
+        calib_active = _CALIB.get() is not None
         bt.logging.info(
             f"Scored {len(chunks)} chunks | "
-            f"True={n_true} False={len(scores) - n_true}"
+            f"True={n_true} False={len(scores) - n_true} "
+            f"calib={'on' if calib_active else 'off'}"
         )
-        self._maybe_dump(chunks, scores, synapse)
+        self._maybe_dump(chunks, raw_scores, synapse)
         return synapse
 
     def _maybe_dump(self, chunks, scores, synapse) -> None:
