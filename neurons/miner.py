@@ -46,6 +46,47 @@ CALIBRATION_UIDS = {
     if s.strip()
 }
 
+STRATEGY_ASSIGNMENT_PATH = os.getenv(
+    "POKER44_STRATEGY_ASSIGNMENT_PATH", ""
+)
+SUPPORTED_STRATEGIES = {"baseline", "all_zero", "all_half", "max"}
+
+
+class _StrategyCache:
+    """Hot-reloads {uid: strategy} mapping from a JSON file."""
+
+    def __init__(self):
+        self._mtime = 0.0
+        self._mapping: dict[str, str] = {}
+
+    def get(self, uid: int) -> str:
+        if not STRATEGY_ASSIGNMENT_PATH:
+            return "baseline"
+        try:
+            mt = os.path.getmtime(STRATEGY_ASSIGNMENT_PATH)
+        except OSError:
+            return self._mapping.get(str(uid), "baseline")
+        if mt > self._mtime:
+            try:
+                with open(STRATEGY_ASSIGNMENT_PATH, "r") as fh:
+                    self._mapping = {
+                        str(k): str(v) for k, v in json.load(fh).items()
+                    }
+                self._mtime = mt
+                bt.logging.info(
+                    f"[strategy] reloaded mapping ({len(self._mapping)} "
+                    f"UIDs)"
+                )
+            except Exception as exc:
+                bt.logging.warning(f"[strategy] reload failed: {exc}")
+        s = self._mapping.get(str(uid), "baseline")
+        if s not in SUPPORTED_STRATEGIES:
+            return "baseline"
+        return s
+
+
+_STRATEGY = _StrategyCache()
+
 
 class _CalibrationCache:
     """Hot-reloads sigmoid params from a JSON file via mtime."""
@@ -104,7 +145,7 @@ class Miner(BaseMinerNeuron):
             implementation_files=[Path(__file__).resolve()],
             defaults={
                 "model_name": "poker44-baseline-v1",
-                "model_version": "1.0.3",
+                "model_version": "1.0.4",
                 "framework": "python-heuristic",
                 "license": "MIT",
                 "repo_url": PINNED_REPO_URL,
@@ -138,15 +179,18 @@ class Miner(BaseMinerNeuron):
     ) -> DetectionSynapse:
         chunks = synapse.chunks or []
         raw_scores = [self._score_chunk(chunk) for chunk in chunks]
+        strategy = _STRATEGY.get(self.uid)
+        scores = self._apply_strategy(strategy, chunks, raw_scores)
+
         calib_eligible = (
             not CALIBRATION_UIDS or str(self.uid) in CALIBRATION_UIDS
         )
         if calib_eligible and _CALIB.get() is not None:
-            scores = [_apply_calibration(r) for r in raw_scores]
+            scores = [_apply_calibration(s) for s in scores]
             calib_state = "on"
         else:
-            scores = list(raw_scores)
             calib_state = "off"
+
         synapse.risk_scores = scores
         synapse.predictions = [s >= 0.5 for s in scores]
         synapse.model_manifest = dict(self.model_manifest)
@@ -154,10 +198,29 @@ class Miner(BaseMinerNeuron):
         bt.logging.info(
             f"Scored {len(chunks)} chunks | "
             f"True={n_true} False={len(scores) - n_true} "
-            f"calib={calib_state}"
+            f"strat={strategy} calib={calib_state}"
         )
         self._maybe_dump(chunks, raw_scores, synapse)
         return synapse
+
+    @staticmethod
+    def _apply_strategy(
+        strategy: str, chunks: list, raw_scores: list[float]
+    ) -> list[float]:
+        if strategy == "all_zero":
+            return [0.0] * len(raw_scores)
+        if strategy == "all_half":
+            return [0.5] * len(raw_scores)
+        if strategy == "max":
+            out: list[float] = []
+            for chunk, _ in zip(chunks, raw_scores):
+                if not chunk:
+                    out.append(0.0)
+                    continue
+                hs = [Miner._score_hand(h) for h in chunk]
+                out.append(round(max(hs), 6) if hs else 0.0)
+            return out
+        return list(raw_scores)
 
     def _maybe_dump(self, chunks, scores, synapse) -> None:
         if not DUMP_PATH:
