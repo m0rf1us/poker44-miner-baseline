@@ -49,7 +49,165 @@ CALIBRATION_UIDS = {
 STRATEGY_ASSIGNMENT_PATH = os.getenv(
     "POKER44_STRATEGY_ASSIGNMENT_PATH", ""
 )
-SUPPORTED_STRATEGIES = {"baseline", "all_zero", "all_half", "max"}
+ML_MODEL_PATH = os.getenv("POKER44_ML_MODEL_PATH", "")
+SUPPORTED_STRATEGIES = {"baseline", "all_zero", "all_half", "max", "ml"}
+
+
+_ML_FEATURE_NAMES = [
+    "n_hands", "stack_mean", "stack_min", "stack_max", "stack_unique",
+    "stack_count", "action_total", "actions_per_hand",
+    "ratio_other", "ratio_fold", "ratio_call", "ratio_check",
+    "ratio_raise", "ratio_bet", "ratio_all_in",
+    "streets_mean", "streets_std", "showdown_rate",
+    "n_players_mean", "pot_pre_mean", "pot_pre_max", "pot_post_mean",
+    "pot_post_max", "pot_growth_mean",
+    "end_preflop", "end_flop", "end_turn", "end_river",
+    "amount_mean", "amount_max", "amount_std", "normalized_amount_mean",
+    "action_seq_unique", "fold_to_raise_ratio",
+    "check_to_bet_ratio",
+    "preflop_action_share", "flop_action_share", "turn_action_share",
+    "river_action_share",
+    "min_to_max_stack_ratio",
+]
+
+
+class _MLHolder:
+    """Hot-reloads pickled ensemble artifact from ML_MODEL_PATH."""
+
+    def __init__(self):
+        self._mtime = 0.0
+        self._artifact = None
+
+    def get(self):
+        if not ML_MODEL_PATH:
+            return None
+        try:
+            mt = os.path.getmtime(ML_MODEL_PATH)
+        except OSError:
+            return self._artifact
+        if mt <= self._mtime and self._artifact is not None:
+            return self._artifact
+        try:
+            import pickle
+            with open(ML_MODEL_PATH, "rb") as fh:
+                self._artifact = pickle.load(fh)
+            self._mtime = mt
+            bt.logging.info(
+                f"[ml] reloaded artifact from {ML_MODEL_PATH} "
+                f"(val_ap={self._artifact.get('val_ap')})"
+            )
+        except Exception as exc:
+            bt.logging.warning(f"[ml] reload failed: {exc}")
+        return self._artifact
+
+
+_ML = _MLHolder()
+
+
+def _ml_chunk_features(hands: list) -> list:
+    stacks = []
+    actions_by_street = Counter()
+    action_types = Counter()
+    streets = []
+    pots_pre, pots_post = [], []
+    amounts, norm_amounts = [], []
+    n_players = []
+    end_streets = Counter()
+    action_seq = []
+    showdowns = 0
+    for hand in hands:
+        meta = hand.get("metadata") or {}
+        outcome = hand.get("outcome") or {}
+        players = [p for p in (hand.get("players") or [])
+                   if p.get("starting_stack", 0) > 0]
+        actions = hand.get("actions") or []
+        n_players.append(len(players))
+        end_streets[meta.get("hand_ended_on_street", "")] += 1
+        if outcome.get("showdown"):
+            showdowns += 1
+        for p in players:
+            stacks.append(round(float(p.get("starting_stack", 0) or 0), 4))
+        for a in actions:
+            atype = a.get("action_type", "")
+            action_types[atype] += 1
+            actions_by_street[a.get("street", "")] += 1
+            try:
+                pots_pre.append(float(a.get("pot_before", 0) or 0))
+                pots_post.append(float(a.get("pot_after", 0) or 0))
+            except Exception:
+                pass
+            try:
+                amounts.append(float(a.get("amount", 0) or 0))
+            except Exception:
+                pass
+            try:
+                norm_amounts.append(float(a.get("normalized_amount_bb", 0) or 0))
+            except Exception:
+                pass
+            action_seq.append(atype)
+        streets.append(len(hand.get("streets") or []))
+
+    n_hands = max(1, len(hands))
+    total_actions = max(1, sum(action_types.values()))
+    pot_growth = [(po - pp) for pp, po in zip(pots_pre, pots_post)]
+
+    def m(xs): return float(sum(xs) / len(xs)) if xs else 0.0
+    def mx(xs): return float(max(xs)) if xs else 0.0
+    def mn(xs): return float(min(xs)) if xs else 0.0
+    def sd(xs):
+        if not xs: return 0.0
+        a = sum(xs) / len(xs)
+        return float((sum((x - a) ** 2 for x in xs) / len(xs)) ** 0.5)
+
+    return [
+        n_hands, m(stacks), mn(stacks), mx(stacks),
+        len(set(stacks)), len(stacks),
+        total_actions, total_actions / n_hands,
+        action_types.get("other", 0) / total_actions,
+        action_types.get("fold", 0) / total_actions,
+        action_types.get("call", 0) / total_actions,
+        action_types.get("check", 0) / total_actions,
+        action_types.get("raise", 0) / total_actions,
+        action_types.get("bet", 0) / total_actions,
+        action_types.get("all_in", 0) / total_actions,
+        m(streets), sd(streets),
+        showdowns / n_hands, m(n_players),
+        m(pots_pre), mx(pots_pre),
+        m(pots_post), mx(pots_post),
+        m(pot_growth),
+        end_streets.get("preflop", 0) / n_hands,
+        end_streets.get("flop", 0) / n_hands,
+        end_streets.get("turn", 0) / n_hands,
+        end_streets.get("river", 0) / n_hands,
+        m(amounts), mx(amounts), sd(amounts), m(norm_amounts),
+        len(set(action_seq)),
+        action_types.get("fold", 0) / max(1, action_types.get("raise", 0) + action_types.get("bet", 0)),
+        action_types.get("check", 0) / max(1, action_types.get("bet", 0) + action_types.get("raise", 0)),
+        actions_by_street.get("preflop", 0) / total_actions,
+        actions_by_street.get("flop", 0) / total_actions,
+        actions_by_street.get("turn", 0) / total_actions,
+        actions_by_street.get("river", 0) / total_actions,
+        (mn(stacks) / max(1e-6, mx(stacks))) if stacks else 0.0,
+    ]
+
+
+def _ml_predict(chunks: list) -> list:
+    art = _ML.get()
+    if art is None or not chunks:
+        return [0.0] * len(chunks)
+    import numpy as np
+    X = np.array([_ml_chunk_features(c) for c in chunks], dtype=np.float32)
+    try:
+        p_lgb = art["lightgbm"].predict_proba(X)[:, 1]
+        p_rf = art["rf"].predict_proba(X)[:, 1]
+        Xs = art["scaler"].transform(X)
+        p_lr = art["logreg"].predict_proba(Xs)[:, 1]
+        w = art.get("ens_weights", {"lightgbm": 0.5, "rf": 0.3, "logreg": 0.2})
+        ens = (w["lightgbm"] * p_lgb + w["rf"] * p_rf + w["logreg"] * p_lr)
+        return [float(round(x, 6)) for x in ens]
+    except Exception as exc:
+        bt.logging.warning(f"[ml] predict failed: {exc}; falling back to zeros")
+        return [0.0] * len(chunks)
 
 
 class _StrategyCache:
@@ -145,7 +303,7 @@ class Miner(BaseMinerNeuron):
             implementation_files=[Path(__file__).resolve()],
             defaults={
                 "model_name": "poker44-baseline-v1",
-                "model_version": "1.0.4",
+                "model_version": "1.0.5",
                 "framework": "python-heuristic",
                 "license": "MIT",
                 "repo_url": PINNED_REPO_URL,
@@ -220,6 +378,11 @@ class Miner(BaseMinerNeuron):
                 hs = [Miner._score_hand(h) for h in chunk]
                 out.append(round(max(hs), 6) if hs else 0.0)
             return out
+        if strategy == "ml":
+            preds = _ml_predict(chunks)
+            if preds and any(p > 0 for p in preds):
+                return preds
+            return list(raw_scores)
         return list(raw_scores)
 
     def _maybe_dump(self, chunks, scores, synapse) -> None:
