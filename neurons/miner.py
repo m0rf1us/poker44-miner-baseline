@@ -196,14 +196,23 @@ def _ml_predict(chunks: list) -> list:
     if art is None or not chunks:
         return [0.0] * len(chunks)
     import numpy as np
-    X = np.array([_ml_chunk_features(c) for c in chunks], dtype=np.float32)
+    X_full = np.array(
+        [_ml_chunk_features(c) for c in chunks], dtype=np.float32
+    )
+    feat_idx = art.get("feature_indices")
+    X = X_full[:, feat_idx] if feat_idx is not None else X_full
     try:
         p_lgb = art["lightgbm"].predict_proba(X)[:, 1]
         p_rf = art["rf"].predict_proba(X)[:, 1]
         Xs = art["scaler"].transform(X)
         p_lr = art["logreg"].predict_proba(Xs)[:, 1]
-        w = art.get("ens_weights", {"lightgbm": 0.5, "rf": 0.3, "logreg": 0.2})
+        w = art.get(
+            "ens_weights", {"lightgbm": 0.5, "rf": 0.3, "logreg": 0.2}
+        )
         ens = (w["lightgbm"] * p_lgb + w["rf"] * p_rf + w["logreg"] * p_lr)
+        bias = float(art.get("bias_shift") or 0.0)
+        if bias:
+            ens = np.clip(ens + bias, 0.0, 1.0)
         return [float(round(x, 6)) for x in ens]
     except Exception as exc:
         bt.logging.warning(f"[ml] predict failed: {exc}; falling back to zeros")
@@ -303,7 +312,7 @@ class Miner(BaseMinerNeuron):
             implementation_files=[Path(__file__).resolve()],
             defaults={
                 "model_name": "poker44-baseline-v1",
-                "model_version": "1.0.5",
+                "model_version": "1.0.6",
                 "framework": "python-heuristic",
                 "license": "MIT",
                 "repo_url": PINNED_REPO_URL,
