@@ -50,7 +50,31 @@ STRATEGY_ASSIGNMENT_PATH = os.getenv(
     "POKER44_STRATEGY_ASSIGNMENT_PATH", ""
 )
 ML_MODEL_PATH = os.getenv("POKER44_ML_MODEL_PATH", "")
-SUPPORTED_STRATEGIES = {"baseline", "all_zero", "all_half", "max", "ml"}
+SUPPORTED_STRATEGIES = {
+    "baseline", "all_zero", "all_half", "max", "ml", "ml13tens",
+}
+
+
+_ML13TENS_SCORER = None
+
+
+def _ml13tens_predict(chunks: list) -> list:
+    """Score each chunk via tomkaba's TorchScript runtime model.
+
+    Lazy-imports so the torch.jit.load only fires when this strategy is
+    actually requested. Returns 0.0-filled list on any load/predict failure
+    so callers can fall back gracefully.
+    """
+    global _ML13TENS_SCORER
+    if _ML13TENS_SCORER is None:
+        try:
+            from poker44.miner_heuristics import score_chunk as _sc
+            _ML13TENS_SCORER = _sc
+            bt.logging.info("[ml13tens] loaded runtime_model.ts")
+        except Exception as exc:
+            bt.logging.warning(f"[ml13tens] load failed: {exc}")
+            return [0.0] * len(chunks)
+    return [_ML13TENS_SCORER(c) for c in chunks]
 
 
 _ML_FEATURE_NAMES = [
@@ -312,7 +336,7 @@ class Miner(BaseMinerNeuron):
             implementation_files=[Path(__file__).resolve()],
             defaults={
                 "model_name": "poker44-baseline-v1",
-                "model_version": "1.0.6",
+                "model_version": "1.0.7",
                 "framework": "python-heuristic",
                 "license": "MIT",
                 "repo_url": PINNED_REPO_URL,
@@ -389,6 +413,11 @@ class Miner(BaseMinerNeuron):
             return out
         if strategy == "ml":
             preds = _ml_predict(chunks)
+            if preds and any(p > 0 for p in preds):
+                return preds
+            return list(raw_scores)
+        if strategy == "ml13tens":
+            preds = _ml13tens_predict(chunks)
             if preds and any(p > 0 for p in preds):
                 return preds
             return list(raw_scores)
