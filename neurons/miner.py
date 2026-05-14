@@ -51,8 +51,37 @@ STRATEGY_ASSIGNMENT_PATH = os.getenv(
 )
 ML_MODEL_PATH = os.getenv("POKER44_ML_MODEL_PATH", "")
 SUPPORTED_STRATEGIES = {
-    "baseline", "all_zero", "all_half", "max", "ml", "ml13tens",
+    "baseline", "all_zero", "all_half", "max", "ml", "ml13tens", "senoos7",
 }
+
+
+_SENOOS7_DETECTOR = None
+
+
+def _senoos7_predict(chunks: list) -> list:
+    """Score chunks via senoos7's BotDetector (v9_hero RF/GB model).
+
+    Lazy-imports/inits the detector on first call.
+    Returns 0.0-filled list on failure.
+    """
+    global _SENOOS7_DETECTOR
+    if _SENOOS7_DETECTOR is None:
+        try:
+            import os
+            os.environ.setdefault("MODEL_VERSION", "v9_hero")
+            from poker44.miner_model.detector import BotDetector
+            _SENOOS7_DETECTOR = BotDetector()
+            bt.logging.info(
+                f"[senoos7] loaded {_SENOOS7_DETECTOR.model_label}"
+            )
+        except Exception as exc:
+            bt.logging.warning(f"[senoos7] load failed: {exc}")
+            return [0.0] * len(chunks)
+    try:
+        return _SENOOS7_DETECTOR.score_chunks_batch(chunks)
+    except Exception as exc:
+        bt.logging.warning(f"[senoos7] predict failed: {exc}")
+        return [0.0] * len(chunks)
 
 
 _ML13TENS_SCORER = None
@@ -336,7 +365,7 @@ class Miner(BaseMinerNeuron):
             implementation_files=[Path(__file__).resolve()],
             defaults={
                 "model_name": "poker44-baseline-v1",
-                "model_version": "1.0.7",
+                "model_version": "1.0.8",
                 "framework": "python-heuristic",
                 "license": "MIT",
                 "repo_url": PINNED_REPO_URL,
@@ -418,6 +447,11 @@ class Miner(BaseMinerNeuron):
             return list(raw_scores)
         if strategy == "ml13tens":
             preds = _ml13tens_predict(chunks)
+            if preds and any(p > 0 for p in preds):
+                return preds
+            return list(raw_scores)
+        if strategy == "senoos7":
+            preds = _senoos7_predict(chunks)
             if preds and any(p > 0 for p in preds):
                 return preds
             return list(raw_scores)
