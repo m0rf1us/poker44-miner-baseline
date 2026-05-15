@@ -52,7 +52,7 @@ STRATEGY_ASSIGNMENT_PATH = os.getenv(
 ML_MODEL_PATH = os.getenv("POKER44_ML_MODEL_PATH", "")
 SUPPORTED_STRATEGIES = {
     "baseline", "all_zero", "all_half", "max", "ml", "ml13tens",
-    "senoos7", "senoos7_v7", "senoos7_ensemble",
+    "senoos7", "senoos7_v7", "senoos7_ensemble", "v13_live",
 }
 
 
@@ -389,7 +389,7 @@ class Miner(BaseMinerNeuron):
             implementation_files=[Path(__file__).resolve()],
             defaults={
                 "model_name": "poker44-baseline-v1",
-                "model_version": "1.0.9",
+                "model_version": "1.0.10",
                 "framework": "python-heuristic",
                 "license": "MIT",
                 "repo_url": PINNED_REPO_URL,
@@ -486,6 +486,11 @@ class Miner(BaseMinerNeuron):
             return list(raw_scores)
         if strategy == "senoos7_ensemble":
             preds = _senoos7_ensemble_predict(chunks)
+            if preds and any(p > 0 for p in preds):
+                return preds
+            return list(raw_scores)
+        if strategy == "v13_live":
+            preds = _senoos7_predict(chunks, "v13_live_consensus")
             if preds and any(p > 0 for p in preds):
                 return preds
             return list(raw_scores)
