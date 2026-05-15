@@ -51,37 +51,61 @@ STRATEGY_ASSIGNMENT_PATH = os.getenv(
 )
 ML_MODEL_PATH = os.getenv("POKER44_ML_MODEL_PATH", "")
 SUPPORTED_STRATEGIES = {
-    "baseline", "all_zero", "all_half", "max", "ml", "ml13tens", "senoos7",
+    "baseline", "all_zero", "all_half", "max", "ml", "ml13tens",
+    "senoos7", "senoos7_v7", "senoos7_ensemble",
 }
 
 
-_SENOOS7_DETECTOR = None
+_SENOOS7_DETECTORS = {}
 
 
-def _senoos7_predict(chunks: list) -> list:
-    """Score chunks via senoos7's BotDetector (v9_hero RF/GB model).
-
-    Lazy-imports/inits the detector on first call.
-    Returns 0.0-filled list on failure.
-    """
-    global _SENOOS7_DETECTOR
-    if _SENOOS7_DETECTOR is None:
-        try:
-            import os
-            os.environ.setdefault("MODEL_VERSION", "v9_hero")
-            from poker44.miner_model.detector import BotDetector
-            _SENOOS7_DETECTOR = BotDetector()
-            bt.logging.info(
-                f"[senoos7] loaded {_SENOOS7_DETECTOR.model_label}"
-            )
-        except Exception as exc:
-            bt.logging.warning(f"[senoos7] load failed: {exc}")
-            return [0.0] * len(chunks)
+def _load_senoos7_detector(version: str):
+    """Lazy-load a senoos7 BotDetector for the given model version."""
+    global _SENOOS7_DETECTORS
+    if version in _SENOOS7_DETECTORS:
+        return _SENOOS7_DETECTORS[version]
     try:
-        return _SENOOS7_DETECTOR.score_chunks_batch(chunks)
+        from pathlib import Path as _Path
+        from poker44.miner_model.detector import BotDetector
+        model_path = (
+            _Path(__file__).resolve().parents[1]
+            / "poker44" / "miner_model" / "models" / version / "model.pkl"
+        )
+        det = BotDetector(model_path=model_path)
+        _SENOOS7_DETECTORS[version] = det
+        bt.logging.info(f"[senoos7] loaded {det.model_label} ({version})")
+        return det
     except Exception as exc:
-        bt.logging.warning(f"[senoos7] predict failed: {exc}")
+        bt.logging.warning(f"[senoos7] load {version} failed: {exc}")
+        return None
+
+
+def _senoos7_predict(chunks: list, version: str = "v9_hero") -> list:
+    """Score chunks via senoos7's BotDetector for the requested version."""
+    det = _load_senoos7_detector(version)
+    if det is None:
         return [0.0] * len(chunks)
+    try:
+        return det.score_chunks_batch(chunks)
+    except Exception as exc:
+        bt.logging.warning(f"[senoos7:{version}] predict failed: {exc}")
+        return [0.0] * len(chunks)
+
+
+def _senoos7_ensemble_predict(chunks: list) -> list:
+    """Average predictions across v7_sigmoid_calib, v8_structured, v9_hero."""
+    parts = []
+    for v in ("v9_hero", "v7_sigmoid_calib", "v8_structured"):
+        p = _senoos7_predict(chunks, v)
+        if p and any(x > 0 for x in p):
+            parts.append(p)
+    if not parts:
+        return [0.0] * len(chunks)
+    n = len(chunks)
+    return [
+        round(sum(part[i] for part in parts) / len(parts), 6)
+        for i in range(n)
+    ]
 
 
 _ML13TENS_SCORER = None
@@ -365,7 +389,7 @@ class Miner(BaseMinerNeuron):
             implementation_files=[Path(__file__).resolve()],
             defaults={
                 "model_name": "poker44-baseline-v1",
-                "model_version": "1.0.8",
+                "model_version": "1.0.9",
                 "framework": "python-heuristic",
                 "license": "MIT",
                 "repo_url": PINNED_REPO_URL,
@@ -451,7 +475,17 @@ class Miner(BaseMinerNeuron):
                 return preds
             return list(raw_scores)
         if strategy == "senoos7":
-            preds = _senoos7_predict(chunks)
+            preds = _senoos7_predict(chunks, "v9_hero")
+            if preds and any(p > 0 for p in preds):
+                return preds
+            return list(raw_scores)
+        if strategy == "senoos7_v7":
+            preds = _senoos7_predict(chunks, "v7_sigmoid_calib")
+            if preds and any(p > 0 for p in preds):
+                return preds
+            return list(raw_scores)
+        if strategy == "senoos7_ensemble":
+            preds = _senoos7_ensemble_predict(chunks)
             if preds and any(p > 0 for p in preds):
                 return preds
             return list(raw_scores)
