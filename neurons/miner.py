@@ -53,6 +53,7 @@ ML_MODEL_PATH = os.getenv("POKER44_ML_MODEL_PATH", "")
 SUPPORTED_STRATEGIES = {
     "baseline", "all_zero", "all_half", "max", "ml", "ml13tens",
     "senoos7", "senoos7_v7", "senoos7_ensemble", "v13_live",
+    "baseline_shift20", "baseline_shift10", "baseline_shift30",
 }
 
 
@@ -389,7 +390,7 @@ class Miner(BaseMinerNeuron):
             implementation_files=[Path(__file__).resolve()],
             defaults={
                 "model_name": "poker44-baseline-v1",
-                "model_version": "1.0.10",
+                "model_version": "1.0.11",
                 "framework": "python-heuristic",
                 "license": "MIT",
                 "repo_url": PINNED_REPO_URL,
@@ -494,6 +495,12 @@ class Miner(BaseMinerNeuron):
             if preds and any(p > 0 for p in preds):
                 return preds
             return list(raw_scores)
+        if strategy == "baseline_shift20":
+            return [min(0.49, max(0.0, r + 0.20)) for r in raw_scores]
+        if strategy == "baseline_shift10":
+            return [min(0.49, max(0.0, r + 0.10)) for r in raw_scores]
+        if strategy == "baseline_shift30":
+            return [min(0.49, max(0.0, r + 0.30)) for r in raw_scores]
         return list(raw_scores)
 
     def _maybe_dump(self, chunks, scores, synapse) -> None:
