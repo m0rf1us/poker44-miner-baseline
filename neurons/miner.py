@@ -54,7 +54,98 @@ SUPPORTED_STRATEGIES = {
     "baseline", "all_zero", "all_half", "max", "ml", "ml13tens",
     "senoos7", "senoos7_v7", "senoos7_ensemble", "v13_live",
     "baseline_shift20", "baseline_shift10", "baseline_shift30",
+    "silvanus_gru",
 }
+
+
+_SILVANUS_MODEL = None
+_SILVANUS_NORM = None
+
+
+def _load_silvanus():
+    global _SILVANUS_MODEL, _SILVANUS_NORM
+    if _SILVANUS_MODEL is not None:
+        return True
+    try:
+        import torch
+        from pathlib import Path as _P
+        # Add silvanus's path
+        repo = _P(__file__).resolve().parents[1]
+        import sys as _sys
+        if str(repo) not in _sys.path:
+            _sys.path.insert(0, str(repo))
+        from poker_bot_detection.models.gru_model import (
+            GRUTransformerClassifier,
+        )
+        from poker_bot_detection.utils.dataset import load_feature_norm
+        import poker_bot_detection.config as cfg
+        device = torch.device("cpu")
+        model = GRUTransformerClassifier(
+            input_dim=cfg.INPUT_DIM,
+            hidden_dim=cfg.HIDDEN_DIM,
+            gru_layers=cfg.NUM_LAYERS,
+            tf_layers=cfg.TF_LAYERS,
+            nhead=cfg.NHEAD,
+            ff_mult=cfg.FF_MULT,
+            dropout=cfg.DROPOUT,
+            max_len=cfg.MAX_SEQ_LEN,
+            bidirectional_gru=cfg.BIDIRECTIONAL_GRU,
+            use_attention_pool=cfg.USE_ATTENTION_POOL,
+        ).to(device)
+        state = torch.load(
+            str(repo / "best_model.pt"),
+            map_location=device, weights_only=False,
+        )
+        if isinstance(state, dict) and "model_state_dict" in state:
+            model.load_state_dict(state["model_state_dict"])
+        else:
+            model.load_state_dict(state)
+        model.eval()
+        mean, std, _ = load_feature_norm(
+            str(repo / "poker_bot_detection" / "feature_norm.pt")
+        )
+        _SILVANUS_MODEL = (model, device, cfg)
+        _SILVANUS_NORM = (mean, std)
+        bt.logging.info("[silvanus_gru] model loaded (best_model.pt)")
+        return True
+    except Exception as exc:
+        bt.logging.warning(f"[silvanus_gru] load failed: {exc}")
+        return False
+
+
+def _silvanus_predict(chunks: list) -> list:
+    if not _load_silvanus():
+        return [0.0] * len(chunks)
+    try:
+        import torch
+        import numpy as _np
+        from poker_bot_detection.utils.features import encode_hand
+        from poker_bot_detection.utils.dataset import (
+            apply_feature_normalization,
+        )
+        model, device, cfg = _SILVANUS_MODEL
+        mean, std = _SILVANUS_NORM
+        out = []
+        for chunk in chunks:
+            if not chunk:
+                out.append(0.5)
+                continue
+            seq = _np.array(
+                [encode_hand(h) for h in chunk], dtype=_np.float32
+            )
+            x = torch.tensor(seq, dtype=torch.float32).unsqueeze(0)
+            lengths = torch.tensor([x.shape[1]], dtype=torch.long)
+            x = apply_feature_normalization(
+                x, mean, std, cfg.FEATURE_NORM_EPS
+            )
+            with torch.no_grad():
+                logits = model(x, lengths=lengths)
+                prob = torch.sigmoid(logits).item()
+            out.append(round(max(0.0, min(1.0, prob)), 6))
+        return out
+    except Exception as exc:
+        bt.logging.warning(f"[silvanus_gru] predict failed: {exc}")
+        return [0.0] * len(chunks)
 
 
 _SENOOS7_DETECTORS = {}
@@ -390,7 +481,7 @@ class Miner(BaseMinerNeuron):
             implementation_files=[Path(__file__).resolve()],
             defaults={
                 "model_name": "poker44-baseline-v1",
-                "model_version": "1.0.11",
+                "model_version": "1.0.12",
                 "framework": "python-heuristic",
                 "license": "MIT",
                 "repo_url": PINNED_REPO_URL,
@@ -501,6 +592,11 @@ class Miner(BaseMinerNeuron):
             return [min(0.49, max(0.0, r + 0.10)) for r in raw_scores]
         if strategy == "baseline_shift30":
             return [min(0.49, max(0.0, r + 0.30)) for r in raw_scores]
+        if strategy == "silvanus_gru":
+            preds = _silvanus_predict(chunks)
+            if preds and any(p > 0 for p in preds):
+                return preds
+            return list(raw_scores)
         return list(raw_scores)
 
     def _maybe_dump(self, chunks, scores, synapse) -> None:
